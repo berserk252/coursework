@@ -87,6 +87,7 @@ class Text:
 
     def __init__(self):
         self.cache = {}
+        self.font_cache = {}
         self.font_path = None
         try:
             from PIL import Image, ImageDraw, ImageFont  # noqa: F401
@@ -109,7 +110,9 @@ class Text:
             self.cache.clear()
         if self._pil and self.font_path:
             Image, ImageDraw, ImageFont = self._pil
-            font = ImageFont.truetype(self.font_path, size)
+            if size not in self.font_cache:
+                self.font_cache[size] = ImageFont.truetype(self.font_path, size)
+            font = self.font_cache[size]
             l, t, r, b = font.getbbox(text)
             im = Image.new("L", (r - l + 2, b - t + 2), 0)
             ImageDraw.Draw(im).text((1 - l, 1 - t), text, fill=255, font=font)
@@ -204,11 +207,13 @@ def fmt(v):
 #  Холст поля (дивергенция / ротор)
 # ---------------------------------------------------------------------------
 
-def field_canvas(P_W, P_H, frame, dc: DivCurl, which: str, txt: Text, edges=True, compact=False, st=None):
+def field_canvas(P_W, P_H, frame, dc: DivCurl, which: str, txt: Text, edges=True, compact=False, st=None,
+                 overlay=None):
     """compact=True -- маленький холст для угла кадра: короткий заголовок,
     без подзаголовка и подписей шкалы. st -- состояние StoppedDetector:
     стоящие машины закрашиваются серым (у них поток 0, ротор и дивергенция
-    их не видят)."""
+    их не видят). overlay(plot) -- дорисовать поверх карты (под стрелками):
+    plot -- уменьшенная копия кадра."""
     img = np.full((P_H, P_W, 3), 255, np.uint8)
     if which == "div":
         val, scale, sign = dc.div, dc.scale_div, 1.0
@@ -265,6 +270,9 @@ def field_canvas(P_W, P_H, frame, dc: DivCurl, which: str, txt: Text, edges=True
             cv2.rectangle(plot, (6, ph - 20), (18, ph - 8), (80, 80, 80), -1)
             txt.draw(plot, "стоящие машины", 22, ph - 22, size=11, color=(60, 60, 60), alt="stopped")
 
+    if overlay is not None:
+        overlay(plot)
+
     # стрелки -- поле скоростей; на мини-холстах угловой панели их не рисуем:
     # там они короче 5 px и сливаются в штриховку
     if not compact and dc.grid is not None and dc.scale_arrow > 0:
@@ -317,16 +325,9 @@ def field_canvas(P_W, P_H, frame, dc: DivCurl, which: str, txt: Text, edges=True
 def _segments(xs, ys):
     """Куски ряда без nan -- nan рисуется разрывом линии."""
     ok = np.isfinite(ys)
-    segs, cur = [], []
-    for x, y, o in zip(xs, ys, ok):
-        if o:
-            cur.append((x, y))
-        elif cur:
-            segs.append(cur)
-            cur = []
-    if cur:
-        segs.append(cur)
-    return segs
+    edges = np.flatnonzero(np.diff(np.r_[False, ok, False])).reshape(-1, 2)
+    xy = np.column_stack((xs, ys))
+    return [xy[start:end] for start, end in edges]
 
 
 def line_plot(img, rect, t, series, title, alt, txt, y_sym=False, t_min=10.0, xlabels=True, y_min_top=0.0):
@@ -366,7 +367,10 @@ def line_plot(img, rect, t, series, title, alt, txt, y_sym=False, t_min=10.0, xl
     for vals, color, label in series:
         yv = np.asarray(vals, np.float64)
         for seg in _segments(tx, yv):
-            pts = np.array([(x, Y(y)) for x, y in seg], np.int32)
+            # На длинном видео тысячи точек: преобразуем весь отрезок сразу,
+            # чтобы не вызывать numpy.clip отдельно для каждой точки.
+            xy = np.asarray(seg, np.float64)
+            pts = np.column_stack((xy[:, 0], Y(xy[:, 1]))).astype(np.int32)
             cv2.polylines(img, [pts], False, color, 2, cv2.LINE_AA)
         if np.isfinite(yv[-1]):
             cv2.circle(img, (int(tx[-1]), int(Y(yv[-1]))), 3, color, -1, cv2.LINE_AA)
