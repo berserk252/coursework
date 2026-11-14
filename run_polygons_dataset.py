@@ -231,8 +231,13 @@ def reuse_preview(item, manifest, work):
     old_manifest = json.loads((old_audit / 'manifest.json').read_text())
     if old_manifest.get('source') != item['source']:
         return False
+    previous_source = old_manifest.get('protected_files', {}).get(item['source'], {})
+    if previous_source.get('sha256') != item['sha256']:
+        return False
     if any(sha(old_audit / 'code_final' / name) != digest for name, digest in manifest['algorithm_sha256'].items()):
-        raise ValueError('Проба для повторного использования получена другой версией алгоритма')
+        return False
+    if not all(p.is_file() for p in paths(previous, item).values()):
+        return False
     proof = json.loads((old_audit / 'no_yolo_proof.json').read_text())
     if not proof.get('flow_only'):
         raise ValueError('Проба использовала нейросеть')
