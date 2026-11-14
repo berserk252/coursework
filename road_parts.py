@@ -65,9 +65,15 @@ class RoadParts:
 
     def save(self, path: str) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        d = {"video": self.video, "frame_size": self.frame_size,
-             "parts": [{"name": p["name"], "points": [[round(x, 4), round(y, 4)] for x, y in p["points"]]}
-                       for p in self.parts if len(p["points"]) >= 3]}
+        parts = []
+        for p in self.parts:
+            if len(p['points']) < 3:
+                continue
+            item = {'name': p['name'], 'points': [[round(x,4), round(y,4)] for x,y in p['points']]}
+            if p.get('holes'):
+                item['holes'] = [[[round(x,4),round(y,4)] for x,y in ring] for ring in p['holes']]
+            parts.append(item)
+        d = {"video": self.video, "frame_size": self.frame_size, "parts": parts}
         with open(path, "w", encoding="utf-8") as f:
             json.dump(d, f, ensure_ascii=False, indent=1)
 
@@ -91,8 +97,14 @@ class RoadParts:
         for k in reversed(range(len(self.parts))):
             m = np.zeros((H, W), np.uint8)
             cv2.fillPoly(m, [self.pixels(k, W, H)], 1)
+            for ring in self.hole_pixels(k, W, H):
+                cv2.fillPoly(m, [ring], 0)
             lab[m > 0] = k
         return lab
+
+    def hole_pixels(self, k, W, H):
+        return [np.round(np.asarray(ring,np.float64)*[W,H]).astype(np.int32)
+                for ring in self.parts[k].get('holes',[]) if len(ring)>=3]
 
     # --- рисование --------------------------------------------------------
 
@@ -104,15 +116,20 @@ class RoadParts:
         for k in range(len(self.parts)):
             color = part_color(k)
             pts = self.pixels(k, W, H)
+            holes = self.hole_pixels(k,W,H)
             if fill_alpha > 0:
                 over = img.copy()
-                cv2.fillPoly(over, [pts], color)
+                mask = np.zeros((H,W),np.uint8)
+                cv2.fillPoly(mask,[pts],1)
+                for ring in holes:cv2.fillPoly(mask,[ring],0)
+                over[mask>0]=color
                 cv2.addWeighted(over, fill_alpha, img, 1 - fill_alpha, 0, dst=img)
             dashed_polyline(img, pts, color, thickness)
+            for ring in holes:dashed_polyline(img,ring,color,thickness)
             if labels and txt is not None:
                 key = (k, W, H)
                 if key not in self._label_xy:
-                    self._label_xy[key] = label_point(pts, W, H)
+                    self._label_xy[key] = label_point(pts, W, H, holes)
                 x, y = self._label_xy[key]
                 txt.draw(img, self.parts[k]["name"], x + 1, y + 1, size=size, color=(255, 255, 255),
                          alt=f"part {k + 1}")
@@ -120,11 +137,12 @@ class RoadParts:
         return img
 
 
-def label_point(pts: np.ndarray, W: int, H: int):
+def label_point(pts: np.ndarray, W: int, H: int, holes=()):
     """Место подписи части: внутри полигона, у правого края его средней по высоте строки
     (слева у дорог на снимках чаще всего обочина, где встают машины)."""
     m = np.zeros((H, W), np.uint8)
     cv2.fillPoly(m, [pts], 1)
+    for ring in holes:cv2.fillPoly(m,[ring],0)
     m = cv2.erode(m, np.ones((15, 15), np.uint8))
     ys, xs = np.nonzero(m)
     if len(xs) == 0:

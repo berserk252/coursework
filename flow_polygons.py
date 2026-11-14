@@ -51,8 +51,7 @@ from flow_canvas import Text, field_canvas, fmt, line_plot, num, video_panel
 from flow_filters import FlowCleaner, SceneGuard
 from bg_model import BackgroundModel
 from flow_holes import HoleDetector, pool_mean
-from foreground_objects import ForegroundObjects, clip_holes, combine_objects
-from mask_regions import complete_foreground
+from foreground_objects import ForegroundObjects, FlowRegionConfirmation, stable_output_regions
 from auto_road import scene_plans
 from flow_stats import SpeedMeter
 from road_parts import RoadParts, part_color
@@ -179,6 +178,7 @@ def draw_holes(img, holes, txt, k=1.0, labels=True, fill=True):
         cv2.addWeighted(over, 0.12, img, 0.88, 0, dst=img)
     for index, color in colors.items():
         contours, _ = cv2.findContours((chosen == index).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = [cv2.approxPolyDP(c, max(.6, 1.5 * img.shape[1] / 640), True) for c in contours]
         cv2.drawContours(img, contours, -1, color, 1, cv2.LINE_AA)
 
     if not labels:
@@ -317,14 +317,14 @@ def process(video, out_root, rel, args, txt):
     dc = DivCurl(cell=default_cell(W, args.cell), memory=args.memory, fps=fps)
     frac = np.stack([pool_mean((labels == p).astype(np.float32), dc.cell) for p in range(n_parts)])
     dc_part = np.where(frac.max(axis=0) >= 0.5, frac.argmax(axis=0), -1)
-    sm = SpeedMeter(fps, scale=scale)
+    sm = SpeedMeter(fps, scale=scale, strict_road=True)
     ps = PartSpeed(fps, scale, labels, n_parts)
     guard = SceneGuard(fps)
     guard.update(prev_gray)
-    hd = HoleDetector(fps, labels, scale, incident_s=args.incident_s)
+    hd = HoleDetector(fps, labels, scale, incident_s=args.incident_s, fill_px=0, soft_grow=False, grow_px=24)
     bgm = BackgroundModel(fps, road) if args.bg else None
     occupancy = ForegroundObjects((H, W), fps)
-    bg_ema = {}                                  # номер дырки -> сглаженная доля отличий от фона
+    confirmation=FlowRegionConfirmation(args.incident_s)
     k_frz = np.ones((hd.cell + 1, hd.cell + 1), np.uint8)
     hdiv, hrot, h_in, h_ring = [], [], [], []
     fh = []                                      # по кадрам: средние div/rot по областям (field_stats)
@@ -352,14 +352,15 @@ def process(video, out_root, rel, args, txt):
                    + ["moving_area", "div_mean_per_s", "rot_mean_abs_per_s"]
                    + sum([[f"div_part{p + 1}_per_s", f"rot_abs_part{p + 1}_per_s"] for p in range(n_parts)], [])
                        + ["holes", "hole_area_frac", "hole_idle_max_s", "hole_v_in_px_s", "hole_v_ring_px_s", "incident",
-                          "scene_id", "road_area_px", "road_mode"])
+                          "scene_id", "road_area_px", "road_mode",'bg_recovered_scene_px'])
     d = os.path.join(out_root, "holes", rel)
     os.makedirs(d, exist_ok=True)
     f_holes = open(os.path.join(d, f"{stem}.csv"), "w", newline="")
     th = csv.writer(f_holes)
     th.writerow(["frame", "time_s", "hole_id", "part", "idle_s", "age_s", "area_px", "v_in_px_s",
                  "v_ring_px_s", "ring_ratio", "incident", "bg_diff", "bg_match", "bg_valid", "bg_coverage", "polygon_xy_source_px",
-                 "kind", "bg_removed_frac", "polygon_rings_source_px", "scene_id"])
+                 "kind", "bg_removed_frac", "polygon_rings_source_px", "scene_id", "bg_inferred_frac",
+                 'observed_s','confirmation_s'])
 
     d = os.path.join(out_root, "field_stats", rel)
     os.makedirs(d, exist_ok=True)
@@ -400,7 +401,7 @@ def process(video, out_root, rel, args, txt):
                 road_px = max(int(road.sum()), 1)
                 frac = np.stack([pool_mean((labels == p).astype(np.float32), dc.cell) for p in range(n_parts)])
                 dc_part = np.where(frac.max(axis=0) >= .5, frac.argmax(axis=0), -1)
-                hd = HoleDetector(fps, labels, scale, incident_s=args.incident_s)
+                hd = HoleDetector(fps, labels, scale, incident_s=args.incident_s, fill_px=0, soft_grow=False, grow_px=24)
                 bgm = BackgroundModel(fps, road) if args.bg else None
                 occupancy.reset()
                 ps.masks = [labels == p for p in range(n_parts)]
@@ -424,20 +425,23 @@ def process(video, out_root, rel, args, txt):
         if bgm is not None:
             if cut:
                 bgm.reset()
-                bg_ema.clear()
+                confirmation.reset()
             frozen = np.isfinite(hd.hole_since)
             frozen = cv2.dilate(cv2.resize(frozen.astype(np.uint8), (hd.gw * hd.cell, hd.gh * hd.cell),
                                            interpolation=cv2.INTER_NEAREST), k_frz) > 0
             fz = np.zeros((H, W), bool)
             fz[: frozen.shape[0], : frozen.shape[1]] = frozen[:H, :W]
             if valid:
-                bgm.update(gray, c.moving > 0, fz)
+                bgm.update(gray, c.moving > 0, fz,frame=frame)
+                occupancy.forget_background(bgm.newly_recovered)
+                confirmation.forget_background(bgm.newly_recovered)
             foreground, known = bgm.foreground(gray, still_ref=~fz & ~(c.moving > 0))
-            foreground = complete_foreground(foreground, known, labels, frame=frame)
-            holes = clip_holes(holes, foreground, known, labels) if valid else []
             objects = occupancy.update(gray, bgm.bg, foreground, c.moving, labels, t,
-                                       hd.cell, hd.gh, hd.gw, cut=cut, valid=valid)
-            holes = combine_objects(holes, objects)
+                                       hd.cell, hd.gh, hd.gw, cut=cut, valid=valid, frame=frame, known=known)
+            holes = confirmation.update(holes,objects,labels,hd.cell,t,foreground,known) if valid else []
+            holes = stable_output_regions(holes, occupancy.confirm_s, gray, bgm.bg, frame)
+            for hole in holes:
+                hole.v_in = float(c.mag_clean[hole.mask].mean()) * fps / scale
         real = [h for h in holes if not h.bg_match]          # кандидаты, не опровергнутые фоном
         holes_all, holes = holes, real
         mh = main_hole(holes)
@@ -479,7 +483,8 @@ def process(video, out_root, rel, args, txt):
                        + [len(holes), f"{sum(h.area_px for h in holes) / road_px:.5f}",
                           f"{max((h.idle_s for h in holes), default=0.0):.1f}",
                           f"{mh.v_in:.3f}" if mh is not None else "", f"{mh.v_ring:.3f}" if mh is not None else "",
-                          int(incident), scene_id, int(road.sum()), args.road_mode])
+                          int(incident), scene_id, int(road.sum()), args.road_mode,
+                          int(bgm.recovered.sum()) if bgm is not None else 0])
         for h in holes_all:
             pts = ";".join(" ".join(f"{v / scale:.0f}" for v in xy) for poly in h.polygons for xy in poly)
             th.writerow([idx, f"{t:.3f}", h.id, h.part + 1, f"{h.idle_s:.1f}", f"{h.age_s:.1f}", h.area_px,
@@ -487,7 +492,8 @@ def process(video, out_root, rel, args, txt):
                          f"{h.bg_diff:.3f}", int(h.bg_match),
                          "" if h.bg_valid is None else int(h.bg_valid), f"{h.bg_coverage:.3f}", pts,
                          h.kind, f"{h.bg_removed_frac:.4f}",
-                         json.dumps([np.round(p / scale).astype(int).tolist() for p in h.polygons], separators=(",", ":")), scene_id])
+                         json.dumps([np.round(p / scale).astype(int).tolist() for p in h.polygons], separators=(",", ":")), scene_id,
+                         f"{h.bg_inferred_frac:.4f}",f'{h.observed_s:.3f}',f'{h.confirmation_s:.3f}'])
 
         prev_gray = gray
         if time.monotonic() - progress_at >= 30:
@@ -497,6 +503,24 @@ def process(video, out_root, rel, args, txt):
             progress_at = time.monotonic()
         event_snap = (snap_done is None and holes) or (snap_done == "hole" and incident)
         want_snap = event_snap or idx in snapshot_frames
+        if want_snap and bgm is not None and getattr(args,'debug_masks',False):
+            debug_dir=os.path.join(out_root,'diagnostics',rel,stem)
+            os.makedirs(debug_dir,exist_ok=True)
+            path=os.path.join(debug_dir,f'{idx:06d}')
+            cv2.imwrite(path+'_background.jpg',np.clip(bgm.bg,0,255).astype(np.uint8))
+            cv2.imwrite(path+'_known.png',known.astype(np.uint8)*255)
+            np.savez_compressed(path+'.npz',frame=idx,time_s=t,gray=gray,background=bgm.bg,
+                variance=bgm.var,count=bgm.cnt,foreground=foreground,known=known,pixel_age=occupancy.age,
+                recovered=bgm.recovered,
+                moving=c.moving,labels=labels,
+                flow_cores=np.stack([h.core if h.core is not None else h.cells for h in st.holes]) if st.holes else np.empty((0,hd.gh,hd.gw),bool),
+                hole_masks=np.stack([h.mask for h in holes_all]) if holes_all else np.empty((0,H,W),bool),
+                hole_incident=np.array([h.incident for h in holes_all]),
+                hole_ids=np.array([h.id for h in holes_all]),hole_idle=np.array([h.idle_s for h in holes_all]),
+                hole_observed_s=np.array([h.observed_s for h in holes_all]),
+                hole_anchors=np.stack([h.incident_anchor if h.incident_anchor is not None else np.zeros((H,W),bool) for h in holes_all]) if holes_all else np.empty((0,H,W),bool),
+                hole_bg_diff=np.array([h.bg_diff for h in holes_all]),
+                hole_bg_coverage=np.array([h.bg_coverage for h in holes_all]))
         if not writers and not want_snap:
             continue
         va = video_panel(frame, dc, txt)
@@ -568,6 +592,7 @@ def main():
                     help="Дырка совпадает с фоном, если отличных от него точек меньше этой доли")
     ap.add_argument("--seconds", type=float, default=0, help="Обработать только первые N секунд")
     ap.add_argument("--snapshot_times", default="", help="Моменты снимков через запятую, с; работают и при --outputs none")
+    ap.add_argument('--debug_masks',type=int,default=0,help='Сохранить фон и численные маски в моменты снимков')
     ap.add_argument("--outputs", default="all",
                     help="Какие видео писать через запятую: " + ",".join(OUTPUTS) + "; all -- все, none -- только CSV")
     ap.add_argument("--rel", default=".", help="Для одного файла: подпапка внутри каждой папки результата")

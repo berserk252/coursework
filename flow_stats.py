@@ -42,13 +42,15 @@ NAN = float("nan")
 
 class SpeedMeter:
     def __init__(self, fps: float, scale: float = 1.0, window_s: float = 1.0,
-                 base_s: float = 10.0, warmup_s: float = 3.0, min_area: float = 0.001):
+                 base_s: float = 10.0, warmup_s: float = 3.0, min_area: float = 0.001,
+                 strict_road: bool = False):
         self.fps = float(fps)
         self.scale = float(scale)
         self.window = max(1, round(fps * window_s))
         self.base_a = math.exp(-1.0 / max(fps * base_s, 1.0))
         self.warmup = max(1, round(fps * warmup_s))
         self.min_area = min_area
+        self.strict_road = strict_road
         # история для графиков (через склейки не сбрасывается)
         self.t, self.hv, self.harea, self.hdrop = [], [], [], []
         self.reset()
@@ -72,8 +74,12 @@ class SpeedMeter:
             return self
         road = c.road_w >= 0.5
         # пока маска дороги не накопила статистику (первые ~0.5 с) -- весь кадр
-        if road.sum() < 0.02 * road.size:
+        if road.sum() < 0.02 * road.size and not self.strict_road:
             road = np.ones_like(road)
+        if not road.any():
+            self.v_frame,self.v,self.drop,self.area=NAN,NAN,NAN,0.
+            self._log(t)
+            return self
         mv = c.moving & road
         self.area = float(mv.sum()) / float(road.sum())
         if self.area >= self.min_area:

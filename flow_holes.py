@@ -120,6 +120,11 @@ class Hole:
     mask: np.ndarray = None           # точная пиксельная маска, включая пустые промежутки внутри контура
     kind: str = "flow_gap"            # flow_gap / stationary: стоящий объект сам по себе не доказывает ДТП
     bg_removed_frac: float = 0.0      # какая доля исходной области исключена как фон/неизвестность
+    bg_inferred_frac: float = 0.0     # доля локально восстановленного кузова без наблюдавшегося эталона
+    observed_s: float = 0.0          # время наблюдения подтверждённой области
+    confirmation_s: float = NAN      # момент закрепления опорного контура
+    incident_anchor: np.ndarray = None
+    track_anchor: np.ndarray = None   # исходное пространственное положение наблюдаемой области
 
 
 @dataclass

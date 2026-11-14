@@ -8,7 +8,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bg_model import BackgroundModel
-from mask_regions import complete_foreground
+from mask_regions import complete_foreground, thin_color_lines
 
 
 class MaskRegionTests(unittest.TestCase):
@@ -46,6 +46,23 @@ class MaskRegionTests(unittest.TestCase):
     def test_empty_asphalt_does_not_create_an_object(self):
         result = complete_foreground(np.zeros(self.shape, bool), self.known, self.labels)
         self.assertFalse(result.any())
+
+    def test_thin_burned_in_boxes_are_not_confused_with_wide_colored_bodies(self):
+        frame=np.full((*self.shape,3),180,np.uint8)
+        cv2.rectangle(frame,(30,30),(80,90),(255,100,0),1)
+        cv2.rectangle(frame,(150,30),(210,90),(0,0,220),-1)
+        lines=thin_color_lines(frame)
+        self.assertTrue(lines[30,50]);self.assertFalse(lines[30:91,150:211].any())
+
+    def test_local_unknown_body_gap_can_be_reconstructed_without_filling_known_road(self):
+        pixels=np.zeros(self.shape,bool);pixels[40:80,100:180]=True
+        self.known[40:80,134:146]=False;pixels &= self.known
+        result=complete_foreground(pixels,self.known,self.labels,infer_unknown=True)
+        self.assertTrue(result[50:70,134:146].all())
+        self.assertFalse(result[90:,:].any())
+        # Тот же промежуток при наблюдавшемся пустом асфальте не соединяется.
+        result=complete_foreground(pixels,np.ones_like(self.known),self.labels,infer_unknown=True)
+        self.assertFalse(result[50:70,136:144].any())
 
     def test_missing_white_hood_is_restored_without_outward_growth(self):
         body = np.zeros(self.shape, bool)

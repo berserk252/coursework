@@ -118,6 +118,7 @@ def prepare(args, out, audit):
                 'opencv': cv2.__version__, 'reuse': str(Path(args.reuse).resolve()) if args.reuse else None,
                 'baseline': str(Path(args.baseline).resolve()) if args.baseline else None,
                 'report_copy': str(Path(args.report_copy).resolve()) if args.report_copy else None}
+    manifest['priority_stems']=getattr(args,'first',[]) or []
     save(audit / 'manifest.json', manifest)
     save(out / 'status.json', {'run_status': 'prepared', 'started_utc': now(),
          'videos': {v['key']: {'status': 'pending'} for v in files}, 'total': len(files),
@@ -168,6 +169,29 @@ def verify(root, item):
     proof = json.loads((root / 'flow_only_proof.json').read_text())
     if not proof.get('flow_only'):
         raise ValueError('Нет доказательства запуска без нейросети')
+    diagnostics=root/'diagnostics'/item['rel']/item['stem']
+    if proof.get('debug_masks'):
+        import numpy as np
+        for index in item['snapshots']:
+            path=diagnostics/f'{index:06d}.npz'
+            with np.load(path,allow_pickle=False) as data:
+                masks,red=data['hole_masks'],data['hole_incident'].astype(bool)
+                if masks.size and (masks & (data['labels']<0)[None]).any():
+                    raise ValueError('Полигон вышел за область дороги')
+                if masks.size and (masks.sum(axis=0)>1).any():
+                    raise ValueError('Двойной учёт пикселей разных областей')
+                for index_mask in np.flatnonzero(red):
+                    mask=masks[index_mask]
+                    if data['hole_observed_s'][index_mask]<20-1e-4:
+                        raise ValueError('Область унаследовала чужое время наблюдения')
+                    margin=max(1,round(3*mask.shape[1]/640))
+                    bounded=cv2.dilate(data['hole_anchors'][index_mask].astype(np.uint8),
+                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(2*margin+1,)*2))>0
+                    if (mask&~bounded).any():
+                        raise ValueError('Красная область выросла за закреплённый контур')
+                    observed=mask & data['known']
+                    if observed.sum()<20 or observed.sum()<.5*mask.sum() or data['foreground'][observed].mean()<.25:
+                        raise ValueError('Красная маска не подтверждена наблюдавшимся фоном')
     scale = min(1., 640 / item['width'])
     width, height = round(item['width'] * scale), round(item['height'] * scale)
     width -= width % 2
@@ -220,7 +244,8 @@ def worker(item, manifest, audit):
     finally:
         loaded = sorted(m for m in sys.modules if m.split('.')[0] in FORBIDDEN)
         save(work / 'flow_only_proof.json', {'status': status, 'blocked_imports': blocked,
-             'neural_modules_loaded': loaded, 'flow_only': status == 'complete' and not blocked and not loaded})
+             'neural_modules_loaded': loaded, 'flow_only': status == 'complete' and not blocked and not loaded,
+             'debug_masks':'--debug_masks' in manifest['settings']})
 
 
 def reuse_preview(item, manifest, work):
@@ -245,11 +270,12 @@ def reuse_preview(item, manifest, work):
         target = paths(work, item)[name]
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
-    for kind in ('auto_road', 'snapshots'):
+    for kind in ('auto_road', 'snapshots', 'diagnostics'):
         source = previous / kind / item['rel']
         target = work / kind / item['rel']
-        if kind == 'auto_road':
-            shutil.copytree(source / item['stem'], target / item['stem'])
+        if kind in ('auto_road','diagnostics'):
+            if (source/item['stem']).exists():
+                shutil.copytree(source / item['stem'], target / item['stem'])
         elif source.exists():
             target.mkdir(parents=True, exist_ok=True)
             for p in source.glob(item['stem'] + '_*.png'):
@@ -263,11 +289,13 @@ def publish(work, out, item, audit):
         target = paths(out, item)[name]
         target.parent.mkdir(parents=True, exist_ok=True)
         source.replace(target)
-    for kind in ('auto_road', 'snapshots'):
+    for kind in ('auto_road', 'snapshots', 'diagnostics'):
         source = work / kind / item['rel']
         target = out / kind / item['rel']
         target.mkdir(parents=True, exist_ok=True)
-        if kind == 'auto_road':
+        if kind in ('auto_road','diagnostics'):
+            if kind=='diagnostics' and not (source/item['stem']).exists():
+                continue
             destination = target / item['stem']
             if destination.exists():
                 shutil.rmtree(destination)
@@ -332,7 +360,7 @@ def report(out, manifest, state):
     thead{display:table-header-group}figure{break-inside:avoid; margin:18px 0}img{width:100%}h2{break-before:page}
     </style><h1>Полный прогон оптического потока без YOLO — 14.11.2026</h1>'''
     document += f"<p>Полностью обработано {len(manifest['videos'])} роликов, {manifest['pairs']} межкадровых пар. Пять MP4 на ролик. Все MP4 декодированы целиком; CSV проверены на непрерывность кадров. Ручные зоны и нейросетевые модули не использовались.</p>"
-    document += '<p>Настройки: ширина до 640 px, автоматическая дорога по 10 с движения каждой сцены, накопленный фон, восстановление связанных участков кузова по цвету. Совпадающие маленькие участки внутри кузова восстанавливаются; большие замкнутые фоновые просветы и неизвестные точки исключаются.</p>'
+    document += '<p>Настройки: ширина до 640 px, автоматическая дорога по 10 с движения каждой сцены, накопленный фон, восстановление связанных участков кузова по цвету. Небольшие внутренние просветы восстанавливаются; большие наблюдавшиеся фоновые просветы сохраняются. Узкие неизвестные промежутки между краями кузова могут достраиваться локально и учитываются отдельно от наблюдавшегося эталона. Красный статус требует собственного времени устойчивой области, достаточного фона и связи с дыркой в потоке; новая соседняя очередь не наследует готовое подтверждение.</p>'
     document += '<p>Ограничения: сходные цвета, тени, перекрытия и неизвестный начальный фон оставляют ошибки. Области не гарантируют разделения каждого автомобиля. Числа красных меток — срабатывания правила, а не точность распознавания ДТП. Парные кадры сравнивают версии целиком: ручные зоны старой версии и автоматические зоны новой отличаются.</p>'
     document += '<table><thead><tr><th>Видео</th><th>Пар</th><th>Кадров с областями</th><th>Кадров ДТП?</th><th>Первое ДТП?, с</th></tr></thead><tbody>' + ''.join(rows) + '</tbody></table><h2>Парные кадры аварий</h2>'
     for stem, second, name in pictures:
@@ -425,7 +453,8 @@ def run(args, out, audit, manifest):
                     persist()
                 print('FAILED', key, repr(error), flush=True)
     # Короткий контроль и view4 завершаются рано; аварии идут перед остальными классами.
-    ordered = sorted(manifest['videos'], key=lambda v: (0 if manifest['reuse'] and v['stem'] == 'b2D9m3upSZQ' else
+    priority={stem:i for i,stem in enumerate(manifest.get('priority_stems',[]))}
+    ordered = sorted(manifest['videos'], key=lambda v: (priority.get(v['stem'],len(priority)),0 if manifest['reuse'] and v['stem'] == 'b2D9m3upSZQ' else
                      1 if v['stem'] == 'negative_samples__negative_samples_803' else 2 if v['stem'] == 'view4' else
                      3 if '5_avariya' in Path(v['rel']).parts else 4, -v['duration_s']))
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
@@ -475,6 +504,7 @@ def main():
     parser.add_argument('--inputs', nargs='+')
     parser.add_argument('--out_root', required=True)
     parser.add_argument('--jobs', type=int, default=3)
+    parser.add_argument('--first',nargs='*',help='Имена роликов без расширения, обрабатываемых первыми')
     parser.add_argument('--protect', nargs='*')
     parser.add_argument('--reuse')
     parser.add_argument('--baseline')

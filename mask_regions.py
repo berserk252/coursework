@@ -3,6 +3,22 @@ import cv2
 import numpy as np
 
 
+def thin_color_lines(frame):
+    """Тонкие цветные осевые линии, уже нарисованные в некоторых исходниках.
+
+    Используются только для исключения искусственных деталей из проверки
+    переднего плана. Широкие цветные кузова и поверхности сохраняются.
+    """
+    hsv=cv2.cvtColor(frame,cv2.COLOR_BGR2HSV)
+    color=((hsv[...,1]>100)&(hsv[...,2]>90)).astype(np.uint8)
+    thick=cv2.dilate(cv2.erode(color,np.ones((3,3),np.uint8)),np.ones((5,5),np.uint8))>0
+    thin=color & ~thick
+    length=max(5,round(9*frame.shape[1]/640))
+    lines=(cv2.morphologyEx(thin,cv2.MORPH_OPEN,np.ones((1,length),np.uint8))
+           |cv2.morphologyEx(thin,cv2.MORPH_OPEN,np.ones((length,1),np.uint8)))
+    return cv2.dilate(lines,np.ones((5,5),np.uint8))>0
+
+
 def enclosed_holes(mask, min_area=1, max_area=None):
     """Замкнутые просветы заданной площади, без внешнего фона.
 
@@ -67,7 +83,7 @@ def color_interior(seed, frame, domain, scale):
     return seed | added
 
 
-def complete_foreground(foreground, known, labels, frame=None):
+def complete_foreground(foreground, known, labels, frame=None, infer_unknown=False):
     """Восстановить узкие разрывы и небольшие внутренние участки кузова.
 
     Разница с фоном даёт начальные пиксели, а не готовую сегментацию машины.
@@ -94,4 +110,15 @@ def complete_foreground(foreground, known, labels, frame=None):
             seed = color_interior(seed, frame, domain, scale)
         closed = cv2.morphologyEx(seed.astype(np.uint8), cv2.MORPH_CLOSE, kernel) > 0
         result |= (fill_small_holes(closed, max_area) | seed) & domain & ~asphalt
+        if infer_unknown:
+            # Неизвестный фон внутри кузова — пробел в эталоне, а не пустой
+            # асфальт. Мост разрешён только через неизвестные точки между
+            # наблюдаемыми краями, на расстоянии до 12 px. Известный фон и
+            # соседние части дороги при этом не расширяются.
+            span=max(3,round(25*scale)|1)
+            local=result & (labels==part)
+            joined=cv2.morphologyEx(local.astype(np.uint8),cv2.MORPH_CLOSE,
+                                   cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(span,span)))>0
+            distance=cv2.distanceTransform((~local).astype(np.uint8),cv2.DIST_L2,5)
+            result |= joined & ~known & (labels==part) & (distance<=max(2,12*scale))
     return result

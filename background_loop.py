@@ -73,7 +73,7 @@ def main():
                 flow=cv2.calcOpticalFlowFarneback(previous,gray,None,.5,3,15,3,5,1.2,0)
                 moving=cleaner.update(flow,gray,previous).moving>0
             excluded=moving|protected
-            model.update(gray,excluded,empty)
+            model.update(gray,excluded,empty,frame=frame)
             if model.i%model.step==0:
                 fg,known=model.foreground(gray,still_ref=~excluded)
                 accepted=known & ~fg & ~excluded
