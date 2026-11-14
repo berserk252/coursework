@@ -25,6 +25,8 @@ from collections import deque
 import cv2
 import numpy as np
 
+from mask_regions import motion_footprint
+
 
 class BackgroundModel:
     def __init__(self, fps: float, road: np.ndarray, delay_s: float = 12.0, cap_s: float = 30.0,
@@ -102,7 +104,8 @@ class BackgroundModel:
         self.i += 1
         if self.i % self.step:
             return
-        still = cv2.dilate(moving.astype(np.uint8), self.k_dil) == 0
+        protected = motion_footprint(moving)
+        still = cv2.dilate(protected.astype(np.uint8), self.k_dil) == 0
         self.ring.append((self.smooth(gray), still))
         if len(self.ring) <= self.delay_n:
             return

@@ -52,6 +52,7 @@ from flow_filters import FlowCleaner, SceneGuard
 from bg_model import BackgroundModel
 from flow_holes import HoleDetector, pool_mean
 from foreground_objects import ForegroundObjects, clip_holes, combine_objects
+from mask_regions import complete_foreground
 from auto_road import scene_plans
 from flow_stats import SpeedMeter
 from road_parts import RoadParts, part_color
@@ -432,6 +433,7 @@ def process(video, out_root, rel, args, txt):
             if valid:
                 bgm.update(gray, c.moving > 0, fz)
             foreground, known = bgm.foreground(gray, still_ref=~fz & ~(c.moving > 0))
+            foreground = complete_foreground(foreground, known, labels, frame=frame)
             holes = clip_holes(holes, foreground, known, labels) if valid else []
             objects = occupancy.update(gray, bgm.bg, foreground, c.moving, labels, t,
                                        hd.cell, hd.gh, hd.gw, cut=cut, valid=valid)
