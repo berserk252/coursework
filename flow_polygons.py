@@ -50,6 +50,8 @@ from divergence_curl import DivCurl, default_cell
 from flow_canvas import Text, field_canvas, fmt, line_plot, num, video_panel
 from flow_filters import FlowCleaner, SceneGuard
 from bg_model import BackgroundModel
+from spatial_support import SpatialSupport
+from flow_trace import TraceWriter
 from flow_holes import HoleDetector, pool_mean
 from foreground_objects import ForegroundObjects, FlowRegionConfirmation, stable_output_regions
 from auto_road import scene_plans
@@ -324,7 +326,10 @@ def process(video, out_root, rel, args, txt):
     hd = HoleDetector(fps, labels, scale, incident_s=args.incident_s, fill_px=0, soft_grow=False, grow_px=24)
     bgm = BackgroundModel(fps, road) if args.bg else None
     occupancy = ForegroundObjects((H, W), fps)
+    spatial = SpatialSupport((H, W))
     confirmation=FlowRegionConfirmation(args.incident_s)
+    trace = TraceWriter(os.path.join(out_root, 'trace_cache', rel, stem), video, fps, (H, W),
+                        n_parts, plans or [(0, rp, {})], scale) if getattr(args, 'trace_cache', False) else None
     k_frz = np.ones((hd.cell + 1, hd.cell + 1), np.uint8)
     hdiv, hrot, h_in, h_ring = [], [], [], []
     fh = []                                      # по кадрам: средние div/rot по областям (field_stats)
@@ -422,10 +427,12 @@ def process(video, out_root, rel, args, txt):
                 return bgm.empty_cells(gray, hd.cell, hd.gh, hd.gw, args.bg_diff_frac, still_ref=~(c.moving > 0))
         st = hd.update(c, t, valid=valid, cut=cut, div=dc.div if valid else None, keep=keep)
         holes = list(st.holes)
+        base_holes = holes
         if bgm is not None:
             if cut:
                 bgm.reset()
                 confirmation.reset()
+                spatial.reset()
             frozen = np.isfinite(hd.hole_since)
             frozen = cv2.dilate(cv2.resize(frozen.astype(np.uint8), (hd.gw * hd.cell, hd.gh * hd.cell),
                                            interpolation=cv2.INTER_NEAREST), k_frz) > 0
@@ -439,7 +446,9 @@ def process(video, out_root, rel, args, txt):
             objects = occupancy.update(gray, bgm.bg, foreground, c.moving, labels, t,
                                        hd.cell, hd.gh, hd.gw, cut=cut, valid=valid, frame=frame, known=known)
             holes = confirmation.update(holes,objects,labels,hd.cell,t,foreground,known) if valid else []
-            holes = stable_output_regions(holes, occupancy.confirm_s, gray, bgm.bg, frame)
+            base_holes = stable_output_regions(holes, occupancy.confirm_s)
+            holes = spatial.update(base_holes, gray, bgm.bg, t, frame=frame, known=known,
+                                   foreground=foreground, pixel_age=occupancy.age, scene_id=scene_id) if valid else []
             for hole in holes:
                 hole.v_in = float(c.mag_clean[hole.mask].mean()) * fps / scale
         real = [h for h in holes if not h.bg_match]          # кандидаты, не опровергнутые фоном
@@ -495,6 +504,12 @@ def process(video, out_root, rel, args, txt):
                          json.dumps([np.round(p / scale).astype(int).tolist() for p in h.polygons], separators=(",", ":")), scene_id,
                          f"{h.bg_inferred_frac:.4f}",f'{h.observed_s:.3f}',f'{h.confirmation_s:.3f}'])
 
+        if trace is not None:
+            trace.add(idx, t, dc, base_holes, holes_all, c.mag_clean, known, foreground, occupancy.age,
+                      bgm.bg, scene_id, sm, ps, fh,
+                      dict(valid=valid, cut=cut, speed=sm.v, part_speeds=list(ps.v), moving_area=sm.area,
+                           part_field=pstats, road_area_px=int(road.sum()), road_mode=args.road_mode,
+                           bg_recovered_scene_px=int(bgm.recovered.sum())), gray=gray)
         prev_gray = gray
         if time.monotonic() - progress_at >= 30:
             for stream in (f_csv, f_holes, f_fs):
@@ -553,6 +568,8 @@ def process(video, out_root, rel, args, txt):
                 snap_done = "inc" if incident else "hole"
 
     cap.release()
+    if trace is not None:
+        trace.close()
     for w in writers.values():
         w.release()
     f_csv.close()
@@ -593,10 +610,13 @@ def main():
     ap.add_argument("--seconds", type=float, default=0, help="Обработать только первые N секунд")
     ap.add_argument("--snapshot_times", default="", help="Моменты снимков через запятую, с; работают и при --outputs none")
     ap.add_argument('--debug_masks',type=int,default=0,help='Сохранить фон и численные маски в моменты снимков')
+    ap.add_argument('--trace_cache', type=int, default=0, help='Сохранить точные промежуточные данные для повторной проверки полигонов')
     ap.add_argument("--outputs", default="all",
                     help="Какие видео писать через запятую: " + ",".join(OUTPUTS) + "; all -- все, none -- только CSV")
     ap.add_argument("--rel", default=".", help="Для одного файла: подпапка внутри каждой папки результата")
     args = ap.parse_args()
+    if args.trace_cache and not args.bg:
+        ap.error('--trace_cache требует --bg 1')
     if args.outputs == "all":
         args.outputs_set = set(OUTPUTS)
     elif args.outputs == "none":

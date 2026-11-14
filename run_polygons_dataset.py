@@ -28,7 +28,7 @@ KINDS = ('combined', 'video_arrows', 'divergence', 'curl', 'graphs')
 TABLES = ('stats', 'holes', 'field_stats')
 ALGORITHM = ('flow_polygons.py', 'flow_canvas.py', 'flow_filters.py', 'divergence_curl.py',
              'flow_stats.py', 'bg_model.py', 'flow_holes.py', 'foreground_objects.py',
-             'auto_road.py', 'road_parts.py', 'mask_regions.py')
+             'auto_road.py', 'road_parts.py', 'mask_regions.py', 'spatial_support.py', 'flow_trace.py')
 FORBIDDEN = {'torch', 'torchvision', 'ultralytics', 'vehicle_tracker'}
 SETTINGS = ['--road_mode', 'auto', '--road_seconds', '10', '--max_width', '640',
             '--cell', '24', '--memory', '0.9', '--egomotion', '1', '--edges', '1',
@@ -270,10 +270,10 @@ def reuse_preview(item, manifest, work):
         target = paths(work, item)[name]
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
-    for kind in ('auto_road', 'snapshots', 'diagnostics'):
+    for kind in ('auto_road', 'snapshots', 'diagnostics', 'trace_cache'):
         source = previous / kind / item['rel']
         target = work / kind / item['rel']
-        if kind in ('auto_road','diagnostics'):
+        if kind in ('auto_road','diagnostics','trace_cache'):
             if (source/item['stem']).exists():
                 shutil.copytree(source / item['stem'], target / item['stem'])
         elif source.exists():
@@ -289,12 +289,12 @@ def publish(work, out, item, audit):
         target = paths(out, item)[name]
         target.parent.mkdir(parents=True, exist_ok=True)
         source.replace(target)
-    for kind in ('auto_road', 'snapshots', 'diagnostics'):
+    for kind in ('auto_road', 'snapshots', 'diagnostics', 'trace_cache'):
         source = work / kind / item['rel']
         target = out / kind / item['rel']
         target.mkdir(parents=True, exist_ok=True)
-        if kind in ('auto_road','diagnostics'):
-            if kind=='diagnostics' and not (source/item['stem']).exists():
+        if kind in ('auto_road','diagnostics','trace_cache'):
+            if kind in ('diagnostics','trace_cache') and not (source/item['stem']).exists():
                 continue
             destination = target / item['stem']
             if destination.exists():
